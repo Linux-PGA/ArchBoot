@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ================================
-# Arch TUI Installer with Optional Packages
+# Arch TUI Installer 
 # ================================
 
 GREEN="\e[32m"
