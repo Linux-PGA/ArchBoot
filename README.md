@@ -7,8 +7,8 @@ curl -fsSL -o AME.sh https://raw.githubusercontent.com/Linux-PGA/ArchBoot/refs/h
 
 chmod +x AME.sh
 
-less AME.sh        # (Optional) review the script
+less AME.sh  (Optional) review the script
 
-sudo ./AME.sh.   # (Run the Script)
+sudo ./AME.sh.   (Run the Script)
 
 Enjoy ❤️❤️
