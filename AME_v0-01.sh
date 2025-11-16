@@ -2,7 +2,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-# Arch TUI Installer - Final fixed script (with kernel header fix for DKMS)
+# Arch TUI Installer - Final, stable version (fixes device stability, kernel headers, and parsing)
 # Usage: Save to /root/install-vm-final.sh on Arch live ISO, run: bash /root/install-vm-final.sh
 
 GREEN="\e[32m"; RED="\e[31m"; YELLOW="\e[33m"; RESET="\e[0m"
@@ -24,13 +24,13 @@ password_input(){ whiptail --title "Password" --passwordbox "$1" 10 70 3>&1 1>&2
 arch_chroot(){ arch-chroot "$MNT" /bin/bash -lc "$*"; }
 
 gauge_step(){
-  local title="$1"; local message="$2"; local duration=${3:-3}
-  (
-    for i in $(seq 0 5 100); do
-      echo $i
-      sleep $(bc <<< "$duration*0.05")
-    done
-  ) | whiptail --title "$title" --gauge "$message" 10 70 0
+    local title="$1"; local message="$2"; local duration=${3:-3}
+    (
+        for i in $(seq 0 5 100); do
+            echo $i
+            sleep $(bc <<< "$duration*0.05")
+        done
+    ) | whiptail --title "$title" --gauge "$message" 10 70 0
 }
 
 # ----------------------
@@ -47,11 +47,8 @@ msg "Virtualization detected: $VIRT"
 # Device listing (safe, no awk quoting issues)
 # ----------------------
 msg "Detecting block devices..."
-# produce pairs: tag description
 DEVICE_PAIRS=()
-# Use lsblk columns: NAME SIZE TYPE MODEL (MODEL may contain spaces)
 while read -r name size type model_rest; do
-  # In case model_rest is empty: keep it simple
   desc="${name} (${size}) ${type} ${model_rest}"
   DEVICE_PAIRS+=("$name" "$desc")
 done < <(lsblk -dpno NAME,SIZE,TYPE,MODEL | grep -E '/dev/(sd|nvme|mmcblk)' || true)
@@ -91,7 +88,7 @@ if [[ "$AUTO_PART" == "ask" ]]; then
   fi
 fi
 
-# Format decision (fixed whiptail menu entries)
+# Format decision
 if ask "Format target partitions? WARNING: this will erase data on selected partitions"; then
   DO_FORMAT="yes"
   FS_ROOT=$(menu "Filesystem for root" \
@@ -183,9 +180,8 @@ docker "Container runtime" OFF \
 docker-compose "Container tool" OFF 3>&1 1>&2 2>&3)
 
 OPTIONAL_PKGS=()
-# Safer way to parse whiptail checklist output
+# Using read -r -a for safer parsing of whiptail output
 if [[ -n "${OPTIONAL_RAW// }" ]]; then
-  # Remove surrounding quotes, then read into array
   read -r -a OPTIONAL_PKGS <<< "${OPTIONAL_RAW//\"/}"
 fi
 
@@ -230,6 +226,10 @@ if [[ "$AUTO_PART" == "yes" ]]; then
   msg "Auto-creating partitions on $DISK..."
   if [[ "$USE_EFI" == "yes" ]]; then
     parted -s "$DISK" mklabel gpt || die "Failed to create GPT label"
+    # FIX: Ensure kernel re-reads partition table and device node exists
+    partprobe "$DISK" || true 
+    sleep 2
+    
     parted -s "$DISK" mkpart primary fat32 1MiB 551MiB || die "Failed to create EFI partition"
     parted -s "$DISK" set 1 esp on || true
     parted -s "$DISK" mkpart primary ext4 551MiB 100% || die "Failed to create root partition"
@@ -240,6 +240,10 @@ if [[ "$AUTO_PART" == "yes" ]]; then
     fi
   else
     parted -s "$DISK" mklabel msdos || die "Failed to create msdos label"
+    # FIX: Ensure kernel re-reads partition table and device node exists
+    partprobe "$DISK" || true 
+    sleep 2
+    
     parted -s "$DISK" mkpart primary ext4 1MiB 100% || die "Failed to create root partition"
     if [[ "$DISK" =~ nvme ]]; then ROOT_PART="${DISK}p1"; else ROOT_PART="${DISK}1"; fi
     EFI_PART=""
@@ -278,7 +282,7 @@ success "Mounted partitions"
 # install base
 gauge_step "Base install" "Installing base system (pacstrap)..." 10
 
-# --- FIX: Dynamically determine and install kernel headers for DKMS/VM tools ---
+# FIX: Dynamically determine and install kernel headers for DKMS/VM tools 
 case "$KERNEL" in
   linux) HDR_PKG="linux-headers" ;;
   linux-lts) HDR_PKG="linux-lts-headers" ;;
@@ -299,7 +303,6 @@ if [ ${#DESKTOP_PKGS[@]} -ne 0 ] || [ ${#AUDIO_PKGS[@]} -ne 0 ]; then
   arch_chroot "pacman -Syu --noconfirm ${DESKTOP_PKGS[*]} ${AUDIO_PKGS[*]}"
 fi
 if [ ${#OPTIONAL_PKGS[@]} -ne 0 ]; then
-  # Use -S, not -Syu, to install optional packages only
   arch_chroot "pacman -S --noconfirm ${OPTIONAL_PKGS[*]}" || msg "Some optional packages failed"
 fi
 success "Packages installed"
@@ -320,8 +323,7 @@ success "System configured"
 if [[ "$INSTALL_NVIDIA" == "yes" ]]; then
   gauge_step "NVIDIA" "Installing NVIDIA drivers..." 5
   # Use nvidia-dkms since kernel headers are now guaranteed to be installed
-  NVIDIA_PKG="nvidia-dkms" 
-  arch_chroot "pacman -S --noconfirm $NVIDIA_PKG nvidia-utils nvidia-settings" || msg "NVIDIA install had issues"
+  arch_chroot "pacman -S --noconfirm nvidia-dkms nvidia-utils nvidia-settings" || msg "NVIDIA install had issues"
   success "NVIDIA handled"
 fi
 
@@ -330,8 +332,6 @@ gauge_step "VM Tools" "Installing VM guest tools if detected..." 3
 VIRT_LOWER=$(echo "$VIRT" | tr '[:upper:]' '[:lower:]')
 VM_PKGS=()
 VM_ENABLE_CMDS=()
-
-# The kernel header package is no longer needed here, as it was added to BASE_PKGS
 if [[ "$VIRT_LOWER" == "oracle" || "$VIRT_LOWER" == "virtualbox" ]]; then
   VM_PKGS+=(virtualbox-guest-dkms dkms virtualbox-guest-utils)
   VM_ENABLE_CMDS+=( "systemctl enable vboxservice" )
@@ -378,8 +378,7 @@ EOF"
   arch_chroot "echo 'default arch' > /boot/efi/loader/loader.conf"
   success "systemd-boot installed"
 else
-  # Removed redundant os-prober package install here (already in BASE_PKGS)
-  arch_chroot "pacman -S --noconfirm grub"
+  arch_chroot "pacman -S --noconfirm grub" # os-prober is already in base
   if [[ "$USE_EFI" == "yes" ]]; then
     arch_chroot "grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB --recheck || true"
   else
