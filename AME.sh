@@ -2,8 +2,8 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-# Arch TUI Installer - Full-feature, VM-aware, fixed whiptail menus
-# Save as /root/install-vm-aware.sh on the Arch live ISO and run: bash /root/install-vm-aware.sh
+# Arch TUI Installer - Final fixed script (no awk quoting bugs)
+# Usage: Save to /root/install-vm-final.sh on Arch live ISO, run: bash /root/install-vm-final.sh
 
 GREEN="\e[32m"; RED="\e[31m"; YELLOW="\e[33m"; RESET="\e[0m"
 LOG="/var/log/arch-tui-installer.log"
@@ -11,7 +11,7 @@ exec &> >(tee -a "$LOG")
 
 MNT="/mnt"
 
-whiptail --title "Arch TUI Installer (VM-aware, fixed)" --msgbox "Welcome — this installer auto-detects EFI and virtualization, fixes whiptail issues, and is VirtualBox/VM-aware.\n\nBACKUP any important data before formatting." 12 70
+whiptail --title "Arch TUI Installer (final)" --msgbox "Welcome — read prompts carefully. This script auto-detects EFI and virtualization and will confirm before formatting." 12 70
 
 die(){ echo -e "${RED}ERROR:${RESET} $*" | tee -a "$LOG"; exit 1; }
 msg(){ echo -e "${YELLOW}$*${RESET}" | tee -a "$LOG"; }
@@ -25,49 +25,45 @@ arch_chroot(){ arch-chroot "$MNT" /bin/bash -lc "$*"; }
 
 gauge_step(){
   local title="$1"; local message="$2"; local duration=${3:-3}
-  ( for i in $(seq 0 5 100); do echo $i; sleep $(bc <<< "$duration*0.05"); done ) \
-    | whiptail --title "$title" --gauge "$message" 10 70 0
+  (
+    for i in $(seq 0 5 100); do
+      echo $i
+      sleep $(bc <<< "$duration*0.05")
+    done
+  ) | whiptail --title "$title" --gauge "$message" 10 70 0
 }
 
 # ----------------------
-# Detect EFI from live environment
+# Detect EFI, virtualization
 # ----------------------
 if [ -d /sys/firmware/efi ]; then DETECTED_EFI="yes"; else DETECTED_EFI="no"; fi
 msg "EFI detected by live environment: $DETECTED_EFI"
 
-# ----------------------
-# Detect virtualization (systemd-detect-virt output is best)
-# ----------------------
 VIRT="$(systemd-detect-virt || true)"
-# Normalize empty string
 if [[ -z "$VIRT" ]]; then VIRT="none"; fi
 msg "Virtualization detected: $VIRT"
 
 # ----------------------
-# Helper: is partition?
-# ----------------------
-is_partition(){
-  [[ "$1" =~ [0-9]+$ ]]
-}
-
-# ----------------------
-# List devices (disks and partitions)
+# Device listing (safe, no awk quoting issues)
 # ----------------------
 msg "Detecting block devices..."
-mapfile -t DEV_LINES < <(lsblk -dpno NAME,SIZE,TYPE,MODEL | grep -E '/dev/(sd|nvme|mmcblk)')
-if [ ${#DEV_LINES[@]} -eq 0 ]; then die "No block devices found."; fi
+# produce pairs: tag description
+DEVICE_PAIRS=()
+# Use lsblk columns: NAME SIZE TYPE MODEL (MODEL may contain spaces)
+while read -r name size type model_rest; do
+  # In case model_rest is empty: keep it simple
+  desc="${name} (${size}) ${type} ${model_rest}"
+  DEVICE_PAIRS+=("$name" "$desc")
+done < <(lsblk -dpno NAME,SIZE,TYPE,MODEL | grep -E '/dev/(sd|nvme|mmcblk)' || true)
 
-DEVICE_MENU=()
-for ln in "${DEV_LINES[@]}"; do
-  dev=$(awk '{print $1}' <<<"$ln")
-  size=$(awk '{print $2}' <<<"$ln")
-  typ=$(awk '{print $3}' <<<"$ln")
-  model=$(awk '{for(i=4;i<=NF;++i) printf $i \" \";}' <<<"$ln")
-  label="${dev} — ${size} ${typ} ${model}"
-  DEVICE_MENU+=("$dev" "$label")
-done
+if [ ${#DEVICE_PAIRS[@]} -eq 0 ]; then
+  die "No block devices found."
+fi
 
-ROOT_SEL=$(menu "Select disk or partition to use for root (select whole disk to auto-partition)" "${DEVICE_MENU[@]}") || die "Cancelled"
+ROOT_SEL=$(menu "Select disk or partition to use for root (select whole disk to auto-partition)" "${DEVICE_PAIRS[@]}") || die "Cancelled"
+
+# helper: whether selection is a partition (ends with a digit)
+is_partition(){ [[ "$1" =~ [0-9]+$ ]]; }
 
 if is_partition "$ROOT_SEL"; then
   ROOT_PART="$ROOT_SEL"
@@ -79,14 +75,14 @@ else
   AUTO_PART="ask"
 fi
 
-# ask if user wants EFI (also show detected)
+# Ask about EFI preference (show detection)
 if ask "Do you want to use EFI mode? (If you enabled 'Enable EFI' in VirtualBox choose YES)\nDetected EFI by live system: $DETECTED_EFI"; then
   USE_EFI="yes"
 else
   USE_EFI="no"
 fi
 
-# If whole disk selected, offer auto partition
+# If whole disk chosen ask whether to auto-partition
 if [[ "$AUTO_PART" == "ask" ]]; then
   if ask "You selected whole disk $DISK. Create partitions automatically on this disk now?"; then
     AUTO_PART="yes"
@@ -95,32 +91,33 @@ if [[ "$AUTO_PART" == "ask" ]]; then
   fi
 fi
 
-# Format question + fixed filesystem menu
+# Format decision (fixed whiptail menu entries)
 if ask "Format target partitions? WARNING: this will erase data on selected partitions"; then
   DO_FORMAT="yes"
   FS_ROOT=$(menu "Filesystem for root" \
     ext4 "EXT4 filesystem (recommended)" \
-    btrfs "BTRFS filesystem" \
+    btrfs "BTRFS filesystem (advanced)" \
     xfs "XFS filesystem") || die "Cancelled"
 else
   DO_FORMAT="no"
   FS_ROOT=""
 fi
 
-# Kernel and bootloader selection
-KERNEL=$(menu "Select Kernel package to install" \
+# Kernel and bootloader choices
+KERNEL=$(menu "Select Kernel package" \
   linux "linux (mainline)" \
   linux-lts "linux-lts (LTS kernel)" \
-  linux-zen "linux-zen (zen kernel)") || die "Cancelled"
+  linux-zen "linux-zen (Zen kernel)") || die "Cancelled"
 
+# Bootloader: offer systemd-boot only if EFI requested
 if [[ "$USE_EFI" == "yes" ]]; then
-  BOOTLOADER=$(menu "Select Bootloader" systemd-boot "systemd-boot (EFI)" grub "GRUB (recommended)") || die "Cancelled"
+  BOOTLOADER=$(menu "Select Bootloader" systemd-boot "systemd-boot (EFI simple)" grub "GRUB (works BIOS+EFI)") || die "Cancelled"
 else
-  msg "BIOS/Legacy selected; using GRUB."
   BOOTLOADER="grub"
+  msg "BIOS/Legacy selected; using GRUB."
 fi
 
-# DESKTOP menu (same choices as before)
+# Desktop selection
 DESKTOP=$(menu "Choose Desktop Environment" \
   KDE "Plasma + KDE Apps" \
   GNOME "GNOME Shell" \
@@ -153,7 +150,7 @@ else
   AUDIO_PKGS=()
 fi
 
-# Optional packages checklist
+# Optional packages (checklist)
 OPTIONAL_RAW=$(whiptail --title "Optional Packages" --checklist \
 "Select additional utilities to install (space to toggle)" 25 90 30 \
 fastfetch "Fast system info" OFF \
@@ -188,14 +185,13 @@ docker-compose "Container tool" OFF 3>&1 1>&2 2>&3)
 OPTIONAL_PKGS=()
 if [[ -n "${OPTIONAL_RAW// }" ]]; then eval "OPTIONAL_PKGS=($OPTIONAL_RAW)"; fi
 
-# GPU detection
+# GPU detection and user info
 NVIDIA_PRESENT=$(lspci -nn | grep -i -E 'nvidia|geforce' || true)
 INSTALL_NVIDIA="no"
 if [[ -n "$NVIDIA_PRESENT" ]]; then
   if ask "NVIDIA GPU detected. Install proprietary drivers?"; then INSTALL_NVIDIA="yes"; fi
 fi
 
-# user info
 HOSTNAME=$(input "Enter hostname (e.g. arch-vm):") || die "Cancelled"
 USERNAME=$(input "Enter username:") || die "Cancelled"
 ROOT_PASS=$(password_input "Enter root password (hidden):") || die "Cancelled"
@@ -203,9 +199,8 @@ USER_PASS=$(password_input "Enter password for $USERNAME (hidden):") || die "Can
 TIMEZONE=$(input "Enter timezone (e.g. UTC or Europe/Berlin):") || die "Cancelled"
 LOCALE=$(input "Enter locale (e.g. en_US.UTF-8):") || die "Cancelled"
 
-# final review
 REVIEW="Disk: $DISK
-Root partition: ${ROOT_PART:-<will create>}
+Root partition: ${ROOT_PART:-<will be created>}
 EFI requested: $USE_EFI
 Format: $DO_FORMAT
 Filesystem: ${FS_ROOT:-<existing>}
@@ -225,7 +220,7 @@ Locale: $LOCALE"
 ask "$REVIEW\n\nClick YES to Install Now (this will make changes to the selected disk/partition)" || die "Installation cancelled"
 
 # ----------------------
-# Auto partitioning on whole disk if requested
+# Auto partition if requested
 # ----------------------
 if [[ "$AUTO_PART" == "yes" ]]; then
   msg "Auto-creating partitions on $DISK..."
@@ -234,17 +229,21 @@ if [[ "$AUTO_PART" == "yes" ]]; then
     parted -s "$DISK" mkpart primary fat32 1MiB 551MiB || die "Failed to create EFI partition"
     parted -s "$DISK" set 1 esp on || true
     parted -s "$DISK" mkpart primary ext4 551MiB 100% || die "Failed to create root partition"
-    if [[ "$DISK" =~ nvme ]]; then EFI_PART="${DISK}p1"; ROOT_PART="${DISK}p2"; else EFI_PART="${DISK}1"; ROOT_PART="${DISK}2"; fi
+    if [[ "$DISK" =~ nvme ]]; then
+      EFI_PART="${DISK}p1"; ROOT_PART="${DISK}p2"
+    else
+      EFI_PART="${DISK}1"; ROOT_PART="${DISK}2"
+    fi
   else
     parted -s "$DISK" mklabel msdos || die "Failed to create msdos label"
     parted -s "$DISK" mkpart primary ext4 1MiB 100% || die "Failed to create root partition"
     if [[ "$DISK" =~ nvme ]]; then ROOT_PART="${DISK}p1"; else ROOT_PART="${DISK}1"; fi
     EFI_PART=""
   fi
-  success "Created partitions: root=$ROOT_PART efi=${EFI_PART:-<none>}"
+  success "Created partitions: root=${ROOT_PART} efi=${EFI_PART:-<none>}"
 fi
 
-# sanity checks
+# sanity
 if [[ -z "${ROOT_PART:-}" ]]; then die "No root partition selected or created."; fi
 
 # final format confirmation
@@ -252,7 +251,7 @@ if [[ "$DO_FORMAT" == "yes" ]]; then
   if ! ask "About to format $ROOT_PART ${EFI_PART:+and $EFI_PART}. This will erase data. Are you 100% sure?"; then die "User aborted before formatting."; fi
 fi
 
-# format
+# format partitions
 if [[ "$DO_FORMAT" == "yes" ]]; then
   gauge_step "Formatting" "Formatting partitions..." 3
   case "$FS_ROOT" in
@@ -277,7 +276,7 @@ gauge_step "Base install" "Installing base system (pacstrap)..." 10
 BASE_PKGS=(base "$KERNEL" linux-firmware networkmanager sudo os-prober)
 pacstrap "$MNT" "${BASE_PKGS[@]}" || die "pacstrap failed"
 genfstab -U "$MNT" >> "$MNT/etc/fstab"
-success "Base and fstab done"
+success "Base and fstab created"
 
 # install desktop, audio, optional packages
 gauge_step "Packages" "Installing desktop & selected packages..." 10
@@ -301,7 +300,7 @@ arch_chroot "sed -i 's/^# %wheel ALL=(ALL) ALL/%wheel ALL=(ALL) ALL/' /etc/sudoe
 arch_chroot "systemctl enable NetworkManager || true"
 success "System configured"
 
-# NVIDIA optional
+# NVIDIA drivers if desired
 if [[ "$INSTALL_NVIDIA" == "yes" ]]; then
   gauge_step "NVIDIA" "Installing NVIDIA drivers..." 5
   if [[ "$KERNEL" == "linux" ]]; then NVIDIA_PKG="nvidia"; else NVIDIA_PKG="nvidia-dkms"; fi
@@ -309,23 +308,19 @@ if [[ "$INSTALL_NVIDIA" == "yes" ]]; then
   success "NVIDIA handled"
 fi
 
-# ----------------------
-# VM-specific packages/services
-# ----------------------
+# VM guest tools (based on systemd-detect-virt)
 gauge_step "VM Tools" "Installing VM guest tools if detected..." 3
 VIRT_LOWER=$(echo "$VIRT" | tr '[:upper:]' '[:lower:]')
 VM_PKGS=()
 VM_ENABLE_CMDS=()
-if [[ "$VIRT_LOWER" == "virtualbox" || "$VIRT_LOWER" == "oracle" ]]; then
-  # For VirtualBox: install guest utils; use dkms variant when not sure about kernel modules
-  # Map kernel to header package name
+if [[ "$VIRT_LOWER" == "oracle" || "$VIRT_LOWER" == "virtualbox" ]]; then
+  # map kernel headers
   case "$KERNEL" in
     linux) HDR_PKG="linux-headers" ;;
     linux-lts) HDR_PKG="linux-lts-headers" ;;
     linux-zen) HDR_PKG="linux-zen-headers" ;;
     *) HDR_PKG="${KERNEL}-headers" ;;
   esac
-  # Prefer DKMS to be safe across kernels
   VM_PKGS+=(virtualbox-guest-dkms dkms "$HDR_PKG" virtualbox-guest-utils)
   VM_ENABLE_CMDS+=( "systemctl enable vboxservice" )
 elif [[ "$VIRT_LOWER" == "vmware" ]]; then
@@ -335,17 +330,16 @@ elif [[ "$VIRT_LOWER" == "kvm" || "$VIRT_LOWER" == "kvmqemu" || "$VIRT_LOWER" ==
   VM_PKGS+=(qemu-guest-agent)
   VM_ENABLE_CMDS+=( "systemctl enable --now qemu-guest-agent" )
 elif [[ "$VIRT_LOWER" == "microsoft" || "$VIRT_LOWER" == "hyperv" ]]; then
-  # hyperv-daemons package may not exist on Arch; hyperv support often in linux kernel
-  VM_PKGS+=(hyperv-daemons || true)
+  VM_PKGS+=(hyperv-daemons)
   VM_ENABLE_CMDS+=( "systemctl enable --now hv-fcopy-daemon || true" )
-else
-  VM_PKGS=()
 fi
 
+# install VM pkgs if any (clean empty tokens)
 if [ ${#VM_PKGS[@]} -ne 0 ]; then
-  # filter out empty tokens (in case placeholders exist)
   CLEAN_VM_PKGS=()
-  for p in "${VM_PKGS[@]}"; do [[ -n "$p" && "$p" != "||" && "$p" != "true" ]] && CLEAN_VM_PKGS+=("$p"); done
+  for p in "${VM_PKGS[@]}"; do
+    [[ -n "$p" ]] && CLEAN_VM_PKGS+=("$p")
+  done
   if [ ${#CLEAN_VM_PKGS[@]} -ne 0 ]; then
     arch_chroot "pacman -S --noconfirm ${CLEAN_VM_PKGS[*]}" || msg "VM guest tools install had issues"
     for cmd in "${VM_ENABLE_CMDS[@]}"; do arch_chroot "$cmd" || true; done
@@ -355,9 +349,7 @@ else
   msg "No VM guest tools required for $VIRT"
 fi
 
-# ----------------------
-# Bootloader installation
-# ----------------------
+# bootloader installation
 gauge_step "Bootloader" "Installing bootloader..." 6
 case "$KERNEL" in linux) KVER="linux" ;; linux-lts) KVER="linux-lts" ;; linux-zen) KVER="linux-zen" ;; *) KVER="$KERNEL" ;; esac
 
