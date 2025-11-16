@@ -9,6 +9,8 @@ chmod +x AME.sh
 
 less AME.sh  (Optional) review the script
 
+sed -i 's/\r//g' filename
+
 sudo ./AME.sh.   (Run the Script)
 
 Enjoy ❤️❤️
