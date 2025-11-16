@@ -11,7 +11,7 @@ exec &> >(tee -a "$LOG")
 
 MNT="/mnt"
 
-whiptail --title "Arch TUI Installer (Final Stable)" --msgbox "Welcome. This version uses text input for partition paths to bypass the unreliable TUI menu and install in BIOS mode." 12 70
+whiptail --title "Arch TUI Installer (Final Stable)" --msgbox "Welcome. This version uses text input for partition paths to ensure stability in your VM." 12 70
 
 die(){ echo -e "${RED}ERROR:${RESET} $*" | tee -a "$LOG"; exit 1; }
 msg(){ echo -e "${YELLOW}$*${RESET}" | tee -a "$LOG"; }
@@ -70,10 +70,10 @@ msg "Virtualization detected: $VIRT"
 # ----------------------
 msg "Using text input for partition paths to ensure stability."
 
-# Ask for the root partition directly via text input
+# 1. Ask for the root partition directly via text input
 ROOT_PART=$(input "Enter the full path to your ROOT partition (e.g., /dev/sda2):") || die "Cancelled"
 
-# Ask if the user wants to enable swap
+# 2. Ask if the user wants to enable swap
 if ask "Do you have a separate SWAP partition that you want to enable? (Recommended)"; then
   SWAP_PART=$(input "Enter the full path to your SWAP partition (e.g., /dev/sda1):") || msg "No SWAP partition entered."
 else
@@ -83,7 +83,6 @@ fi
 # Derive other variables
 DISK=$(echo "$ROOT_PART" | sed -E 's/p?[0-9]+$//')
 AUTO_PART="no" 
-USE_EFI="no" # Installing in BIOS/Legacy mode as requested
 
 # New: Enable swap now so genfstab includes it (and confirms it exists)
 if [[ -n "$SWAP_PART" ]]; then
@@ -92,8 +91,20 @@ if [[ -n "$SWAP_PART" ]]; then
     swapon "$SWAP_PART" || msg "Failed to activate swap on $SWAP_PART. Continuing."
 fi
 
+# 3. EFI/Boot Partition Question (Now an ask() prompt)
+if ask "Do you need a separate EFI/Boot partition? Choose NO for BIOS/Legacy Mode (recommended for your setup)."; then
+  USE_EFI="yes"
+  EFI_PART=$(input "Enter the full path to your EFI partition (e.g., /dev/sda1):") || die "Cancelled"
+else
+  USE_EFI="no" # Confirms BIOS/Legacy setup
+  EFI_PART=""
+fi
+
+# The original TUI menu call and subsequent partition logic are removed here.
+# AUTO_PART is now permanently "no"
+
 # --- Format decision ---
-if ask "Format target partitions? WARNING: this will erase data on $ROOT_PART"; then
+if ask "Format target partitions? WARNING: this will erase data on $ROOT_PART ${EFI_PART:+and $EFI_PART}"; then
   DO_FORMAT="yes"
 FS_ROOT=$(menu "Filesystem for root" \
     ext4 "EXT4 filesystem (recommended)" \
@@ -111,10 +122,15 @@ KERNEL=$(menu "Select Kernel package" \
   linux-zen "linux-zen (Zen kernel)") || die "Cancelled"
 
 # Bootloader is GRUB, as USE_EFI is set to 'no'
-BOOTLOADER="grub"
-msg "BIOS/Legacy selected; using GRUB."
+if [[ "$USE_EFI" == "yes" ]]; then
+  BOOTLOADER=$(menu "Select Bootloader" systemd-boot "systemd-boot (EFI simple)" grub "GRUB (works BIOS+EFI)") || die "Cancelled"
+else
+  BOOTLOADER="grub"
+  msg "BIOS/Legacy selected; using GRUB."
+fi
 
-# Desktop selection
+
+# Desktop selection (rest of setup is standard)
 DESKTOP=$(menu "Choose Desktop Environment" \
   KDE "Plasma + KDE Apps" \
   GNOME "GNOME Shell" \
@@ -201,7 +217,7 @@ LOCALE=$(input "Enter locale (e.g. en_US.UTF-8):") || die "Cancelled"
 REVIEW="Disk: $DISK
 Root partition: $ROOT_PART
 Swap partition: ${SWAP_PART:-<none>}
-EFI requested: $USE_EFI (BIOS Mode)
+EFI requested: $USE_EFI
 Format: $DO_FORMAT
 Filesystem: $FS_ROOT
 Kernel: $KERNEL
@@ -220,7 +236,7 @@ if [[ -z "${ROOT_PART:-}" ]]; then die "No root partition selected or created.";
 
 # final format confirmation
 if [[ "$DO_FORMAT" == "yes" ]]; then
-  if ! ask "About to format $ROOT_PART. This will erase data. Are you 100% sure?"; then die "User aborted before formatting."; fi
+  if ! ask "About to format $ROOT_PART ${EFI_PART:+and $EFI_PART}. This will erase data. Are you 100% sure?"; then die "User aborted before formatting."; fi
 fi
 
 # format partitions
@@ -232,6 +248,7 @@ if [[ "$DO_FORMAT" == "yes" ]]; then
     xfs) mkfs.xfs -f "$ROOT_PART" ;;
     *) die "Unsupported filesystem: $FS_ROOT" ;;
   esac
+  if [[ -n "${EFI_PART:-}" ]]; then mkfs.fat -F32 "$EFI_PART"; fi
   success "Formatting complete"
 fi
 
@@ -239,6 +256,7 @@ fi
 gauge_step "Mounting" "Mounting partitions..." 2
 mkdir -p "$MNT"
 mount "$ROOT_PART" "$MNT" || die "Failed to mount $ROOT_PART -> $MNT"
+if [[ -n "${EFI_PART:-}" ]]; then mkdir -p "$MNT/boot/efi"; mount "$EFI_PART" "$MNT/boot/efi" || die "Failed to mount EFI partition"; fi
 success "Mounted partitions"
 
 # install base
@@ -327,12 +345,30 @@ fi
 gauge_step "Bootloader" "Installing bootloader..." 6
 case "$KERNEL" in linux) KVER="linux" ;; linux-lts) KVER="linux-lts" ;; linux-zen) KVER="linux-zen" ;; *) KVER="$KERNEL" ;; esac
 
-# GRUB for BIOS/Legacy mode
-arch_chroot "pacman -S --noconfirm grub"
-DISK_FOR_GRUB="$DISK" # /dev/sda
-arch_chroot "grub-install --target=i386-pc --recheck $DISK_FOR_GRUB || true"
-arch_chroot "grub-mkconfig -o /boot/grub/grub.cfg || true"
-success "GRUB installed"
+if [[ "$BOOTLOADER" == "systemd-boot" ]]; then
+  arch_chroot "pacman -S --noconfirm systemd-boot" || die "systemd-boot install failed"
+  arch_chroot "bootctl --path=/boot/efi install || true"
+  ROOT_UUID=$(blkid -s UUID -o value "$ROOT_PART")
+  arch_chroot "mkdir -p /boot/efi/loader/entries"
+  arch_chroot "cat >/boot/efi/loader/entries/arch.conf <<'EOF'
+title   Arch Linux
+linux   /vmlinuz-${KVER}
+initrd  /initramfs-${KVER}.img
+options root=UUID=${ROOT_UUID} rw
+EOF"
+  arch_chroot "echo 'default arch' > /boot/efi/loader/loader.conf"
+  success "systemd-boot installed"
+else # GRUB for BIOS/Legacy mode
+  arch_chroot "pacman -S --noconfirm grub"
+  if [[ "$USE_EFI" == "yes" ]]; then
+    arch_chroot "grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB --recheck || true"
+  else
+    DISK_FOR_GRUB="$DISK" # /dev/sda
+    arch_chroot "grub-install --target=i386-pc --recheck $DISK_FOR_GRUB || true"
+  fi
+  arch_chroot "grub-mkconfig -o /boot/grub/grub.cfg || true"
+  success "GRUB installed"
+fi
 
 # Enable display manager
 if [[ -n "$DISPLAY_MANAGER" ]]; then
