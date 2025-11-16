@@ -2,9 +2,6 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-# Arch TUI Installer - FINAL FIX: Reliable User Input for Partitions (BIOS/Legacy Mode)
-# ASSUMPTION: You have manually partitioned the disk and are booting in BIOS mode.
-
 GREEN="\e[32m"; RED="\e[31m"; YELLOW="\e[33m"; RESET="\e[0m"
 LOG="/var/log/arch-tui-installer.log"
 exec &> >(tee -a "$LOG")
