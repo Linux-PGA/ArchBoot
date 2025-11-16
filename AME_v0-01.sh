@@ -2,8 +2,8 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-# Arch TUI Installer - FINAL FIX: Hard-coded partition and clean encoding
-# ASSUMPTION: You have manually partitioned /dev/sda1 as root (BIOS/Legacy mode).
+# Arch TUI Installer - FINAL FIX: Reliable User Input for Partitions (BIOS/Legacy Mode)
+# ASSUMPTION: You have manually partitioned the disk and are booting in BIOS mode.
 
 GREEN="\e[32m"; RED="\e[31m"; YELLOW="\e[33m"; RESET="\e[0m"
 LOG="/var/log/arch-tui-installer.log"
@@ -11,7 +11,7 @@ exec &> >(tee -a "$LOG")
 
 MNT="/mnt"
 
-whiptail --title "Arch TUI Installer (Final Stable)" --msgbox "Welcome. This version bypasses the TUI partition menu to use hard-coded, manually created partitions (/dev/sda1)." 12 70
+whiptail --title "Arch TUI Installer (Final Stable)" --msgbox "Welcome. This version uses text input for partition paths to bypass the unreliable TUI menu and install in BIOS mode." 12 70
 
 die(){ echo -e "${RED}ERROR:${RESET} $*" | tee -a "$LOG"; exit 1; }
 msg(){ echo -e "${YELLOW}$*${RESET}" | tee -a "$LOG"; }
@@ -56,7 +56,7 @@ wait_for_device() {
 }
 
 # ----------------------
-# Detect EFI, virtualization
+# Detect EFI, virtualization (Standard detection, not modified)
 # ----------------------
 if [ -d /sys/firmware/efi ]; then DETECTED_EFI="yes"; else DETECTED_EFI="no"; fi
 msg "EFI detected by live environment: $DETECTED_EFI"
@@ -66,17 +66,31 @@ if [[ -z "$VIRT" ]]; then VIRT="none"; fi
 msg "Virtualization detected: $VIRT"
 
 # ----------------------
-# DEVICE SELECTION AND PARTITIONING BYPASS (The Fix)
+# DEVICE SELECTION AND PARTITIONING FIX: Using direct input to bypass broken TUI menu
 # ----------------------
-msg "Skipping partition selection menu and hard-coding partitions."
+msg "Using text input for partition paths to ensure stability."
 
-# Set the disk variables manually based on your BIOS setup
-ROOT_PART="/dev/sda1"
-DISK="/dev/sda"
-AUTO_PART="no"
-USE_EFI="no"
+# Ask for the root partition directly via text input
+ROOT_PART=$(input "Enter the full path to your ROOT partition (e.g., /dev/sda2):") || die "Cancelled"
 
-# The original TUI menu call and subsequent partition logic are removed here.
+# Ask if the user wants to enable swap
+if ask "Do you have a separate SWAP partition that you want to enable? (Recommended)"; then
+  SWAP_PART=$(input "Enter the full path to your SWAP partition (e.g., /dev/sda1):") || msg "No SWAP partition entered."
+else
+  SWAP_PART=""
+fi
+
+# Derive other variables
+DISK=$(echo "$ROOT_PART" | sed -E 's/p?[0-9]+$//')
+AUTO_PART="no" 
+USE_EFI="no" # Installing in BIOS/Legacy mode as requested
+
+# New: Enable swap now so genfstab includes it (and confirms it exists)
+if [[ -n "$SWAP_PART" ]]; then
+    msg "Attempting to enable swap on $SWAP_PART..."
+    mkswap "$SWAP_PART" 2>/dev/null || true # Format as swap (ignore error if already formatted)
+    swapon "$SWAP_PART" || msg "Failed to activate swap on $SWAP_PART. Continuing."
+fi
 
 # --- Format decision ---
 if ask "Format target partitions? WARNING: this will erase data on $ROOT_PART"; then
@@ -87,7 +101,7 @@ FS_ROOT=$(menu "Filesystem for root" \
     xfs "XFS filesystem") || die "Cancelled"
 else
   DO_FORMAT="no"
-  FS_ROOT="ext4" # Default to avoid later errors
+  FS_ROOT="ext4" # Default to ext4 to avoid issues if DO_FORMAT="no"
 fi
 
 # Kernel and bootloader choices
@@ -100,7 +114,7 @@ KERNEL=$(menu "Select Kernel package" \
 BOOTLOADER="grub"
 msg "BIOS/Legacy selected; using GRUB."
 
-# Desktop selection (rest of setup is standard)
+# Desktop selection
 DESKTOP=$(menu "Choose Desktop Environment" \
   KDE "Plasma + KDE Apps" \
   GNOME "GNOME Shell" \
@@ -185,8 +199,9 @@ TIMEZONE=$(input "Enter timezone (e.g. UTC or Europe/Berlin):") || die "Cancelle
 LOCALE=$(input "Enter locale (e.g. en_US.UTF-8):") || die "Cancelled"
 
 REVIEW="Disk: $DISK
-Root partition: $ROOT_PART (Hardcoded)
-EFI requested: $USE_EFI (Hardcoded)
+Root partition: $ROOT_PART
+Swap partition: ${SWAP_PART:-<none>}
+EFI requested: $USE_EFI (BIOS Mode)
 Format: $DO_FORMAT
 Filesystem: $FS_ROOT
 Kernel: $KERNEL
@@ -224,7 +239,6 @@ fi
 gauge_step "Mounting" "Mounting partitions..." 2
 mkdir -p "$MNT"
 mount "$ROOT_PART" "$MNT" || die "Failed to mount $ROOT_PART -> $MNT"
-# EFI/Swap mounting must be done manually by user prior to this step, as TUI is bypassed
 success "Mounted partitions"
 
 # install base
@@ -242,7 +256,7 @@ esac
 BASE_PKGS=(base "$KERNEL" "$HDR_PKG" linux-firmware networkmanager sudo os-prober)
 
 pacstrap "$MNT" "${BASE_PKGS[@]}" || die "pacstrap failed"
-genfstab -U "$MNT" >> "$MNT/etc/fstab"
+genfstab -U -L "$MNT" >> "$MNT/etc/fstab" # Use -L for safer label inclusion
 success "Base and fstab created"
 
 # install desktop, audio, optional packages
