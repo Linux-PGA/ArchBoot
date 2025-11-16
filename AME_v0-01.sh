@@ -34,6 +34,28 @@ gauge_step(){
 }
 
 # ----------------------
+# Helper function to wait for new partitions to appear (FIX for VM stability)
+# ----------------------
+wait_for_device() {
+    local device=$1
+    local max_attempts=15 # Wait up to 15 seconds
+    local attempt=0
+    
+    if [ ! -b "$device" ]; then
+      msg "Waiting for partition device $device to appear..."
+      while [ ! -b "$device" ] && [ $attempt -lt $max_attempts ]; do
+          partprobe "$DISK" 2>/dev/null || true # Tell kernel to rescan
+          sleep 1
+          attempt=$((attempt + 1))
+      done
+      if [ ! -b "$device" ]; then
+          die "Error: Partition device $device did not appear after $max_attempts seconds. Cannot continue."
+      fi
+      success "Device $device appeared."
+    fi
+}
+
+# ----------------------
 # Detect EFI, virtualization
 # ----------------------
 if [ -d /sys/firmware/efi ]; then DETECTED_EFI="yes"; else DETECTED_EFI="no"; fi
@@ -44,17 +66,17 @@ if [[ -z "$VIRT" ]]; then VIRT="none"; fi
 msg "Virtualization detected: $VIRT"
 
 # ----------------------
-# Device listing (safe, no awk quoting issues)
+# Device listing (FIX: Removed -d flag to show partitions)
 # ----------------------
-msg "Detecting block devices..."
+msg "Detecting block devices (disks and partitions)..."
 DEVICE_PAIRS=()
 while read -r name size type model_rest; do
-  desc="${name} (${size}) ${type} ${model_rest}"
-  DEVICE_PAIRS+=("$name" "$desc")
-done < <(lsblk -dpno NAME,SIZE,TYPE,MODEL | grep -E '/dev/(sd|nvme|mmcblk)' || true)
+  desc="${name} (${size}) ${type} ${model_rest}"
+  DEVICE_PAIRS+=("$name" "$desc")
+done < <(lsblk -pno NAME,SIZE,TYPE,MODEL | grep -E '/dev/(sd|nvme|mmcblk)' || true)
 
 if [ ${#DEVICE_PAIRS[@]} -eq 0 ]; then
-  die "No block devices found."
+  die "No block devices found."
 fi
 
 ROOT_SEL=$(menu "Select disk or partition to use for root (select whole disk to auto-partition)" "${DEVICE_PAIRS[@]}") || die "Cancelled"
@@ -63,88 +85,89 @@ ROOT_SEL=$(menu "Select disk or partition to use for root (select whole disk to 
 is_partition(){ [[ "$1" =~ [0-9]+$ ]]; }
 
 if is_partition "$ROOT_SEL"; then
-  ROOT_PART="$ROOT_SEL"
-  DISK=$(echo "$ROOT_PART" | sed -E 's/p?[0-9]+$//')
-  AUTO_PART="no"
+  ROOT_PART="$ROOT_SEL"
+  DISK=$(echo "$ROOT_PART" | sed -E 's/p?[0-9]+$//')
+  AUTO_PART="no"
 else
-  DISK="$ROOT_SEL"
-  ROOT_PART=""
-  AUTO_PART="ask"
+  DISK="$ROOT_SEL"
+  ROOT_PART=""
+  AUTO_PART="ask"
 fi
 
 # Ask about EFI preference (show detection)
 if ask "Do you want to use EFI mode? (If you enabled 'Enable EFI' in VirtualBox choose YES)\nDetected EFI by live system: $DETECTED_EFI"; then
-  USE_EFI="yes"
+  USE_EFI="yes"
 else
-  USE_EFI="no"
+  USE_EFI="no"
 fi
 
 # If whole disk chosen ask whether to auto-partition
 if [[ "$AUTO_PART" == "ask" ]]; then
-  if ask "You selected whole disk $DISK. Create partitions automatically on this disk now?"; then
-    AUTO_PART="yes"
-  else
-    die "Please pre-create partitions and re-run installer."
-  fi
+  if ask "You selected whole disk $DISK. Create partitions automatically on this disk now? (This will erase ALL data on $DISK)"; then
+    AUTO_PART="yes"
+  else
+    die "Please pre-create partitions and re-run installer, or select a pre-existing partition."
+  fi
 fi
 
 # Format decision
 if ask "Format target partitions? WARNING: this will erase data on selected partitions"; then
-  DO_FORMAT="yes"
-  FS_ROOT=$(menu "Filesystem for root" \
-    ext4 "EXT4 filesystem (recommended)" \
-    btrfs "BTRFS filesystem (advanced)" \
-    xfs "XFS filesystem") || die "Cancelled"
+  DO_FORMAT="yes"
+
+FS_ROOT=$(menu "Filesystem for root" \
+    ext4 "EXT4 filesystem (recommended)" \
+    btrfs "BTRFS filesystem (advanced)" \
+    xfs "XFS filesystem") || die "Cancelled"
 else
-  DO_FORMAT="no"
-  FS_ROOT=""
+  DO_FORMAT="no"
+  FS_ROOT=""
 fi
 
 # Kernel and bootloader choices
 KERNEL=$(menu "Select Kernel package" \
-  linux "linux (mainline)" \
-  linux-lts "linux-lts (LTS kernel)" \
-  linux-zen "linux-zen (Zen kernel)") || die "Cancelled"
+  linux "linux (mainline)" \
+  linux-lts "linux-lts (LTS kernel)" \
+  linux-zen "linux-zen (Zen kernel)") || die "Cancelled"
 
 # Bootloader: offer systemd-boot only if EFI requested
 if [[ "$USE_EFI" == "yes" ]]; then
-  BOOTLOADER=$(menu "Select Bootloader" systemd-boot "systemd-boot (EFI simple)" grub "GRUB (works BIOS+EFI)") || die "Cancelled"
+  BOOTLOADER=$(menu "Select Bootloader" systemd-boot "systemd-boot (EFI simple)" grub "GRUB (works BIOS+EFI)") || die "Cancelled"
 else
-  BOOTLOADER="grub"
-  msg "BIOS/Legacy selected; using GRUB."
+  BOOTLOADER="grub"
+  msg "BIOS/Legacy selected; using GRUB."
 fi
 
 # Desktop selection
 DESKTOP=$(menu "Choose Desktop Environment" \
-  KDE "Plasma + KDE Apps" \
-  GNOME "GNOME Shell" \
-  XFCE "XFCE Lightweight" \
-  Cinnamon "Cinnamon Desktop" \
-  LXQt "LXQt Desktop" \
-  MATE "MATE Desktop" \
-  i3 "i3 Tiling WM" \
-  Sway "Sway Wayland WM" \
-  Hyprland "Hyprland Wayland Compositor") || DESKTOP="XFCE"
+  KDE "Plasma + KDE Apps" \
+  GNOME "GNOME Shell" \
+  XFCE "XFCE Lightweight" \
+  Cinnamon "Cinnamon Desktop" \
+  LXQt "LXQt Desktop" \
+  MATE "MATE Desktop" \
+  i3 "i3 Tiling WM" \
+  Sway "Sway Wayland WM" \
+  Hyprland "Hyprland Wayland Compositor") || DESKTOP="XFCE"
 
 declare -a DESKTOP_PKGS
 DISPLAY_MANAGER=""
 case "$DESKTOP" in
-  KDE) DESKTOP_PKGS=(plasma kde-applications sddm); DISPLAY_MANAGER="sddm" ;;
-  GNOME) DESKTOP_PKGS=(gnome gnome-extra gdm); DISPLAY_MANAGER="gdm" ;;
-  XFCE) DESKTOP_PKGS=(xfce4 xfce4-goodies lightdm lightdm-gtk-greeter); DISPLAY_MANAGER="lightdm" ;;
-  Cinnamon) DESKTOP_PKGS=(cinnamon lightdm lightdm-gtk-greeter); DISPLAY_MANAGER="lightdm" ;;
-  LXQt) DESKTOP_PKGS=(lxqt lightdm lightdm-gtk-greeter); DISPLAY_MANAGER="lightdm" ;;
-  MATE) DESKTOP_PKGS=(mate mate-extra lightdm lightdm-gtk-greeter); DISPLAY_MANAGER="lightdm" ;;
-  i3) DESKTOP_PKGS=(i3-wm i3status dmenu xorg xorg-server lightdm lightdm-gtk-greeter); DISPLAY_MANAGER="lightdm" ;;
-  Sway) DESKTOP_PKGS=(sway wlroots wayland xorg-xwayland waybar mako swaybg lightdm lightdm-gtk-greeter); DISPLAY_MANAGER="lightdm" ;;
-  Hyprland) DESKTOP_PKGS=(hyprland wayland xorg-xwayland waybar swaybg mako lightdm lightdm-gtk-greeter); DISPLAY_MANAGER="lightdm" ;;
-  *) DESKTOP_PKGS=(xfce4 xfce4-goodies lightdm lightdm-gtk-greeter); DISPLAY_MANAGER="lightdm" ;;
+  KDE) DESKTOP_PKGS=(plasma kde-applications sddm); DISPLAY_MANAGER="sddm" ;;
+  GNOME) DESKTOP_PKGS=(gnome gnome-extra gdm); DISPLAY_MANAGER="gdm" ;;
+  XFCE) DESKTOP_PKGS=(xfce4 xfce4-goodies lightdm lightdm-gtk-greeter); DISPLAY_MANAGER="lightdm" ;;
+  Cinnamon) DESKTOP_PKGS=(cinnamon lightdm lightdm-gtk-greeter); DISPLAY_MANAGER="lightdm" ;;
+  LXQt) DESKTOP_PKGS=(lxqt lightdm lightdm-gtk-greeter); DISPLAY_MANAGER="lightdm" ;;
+  MATE) DESKTOP_PKGS=(mate mate-extra lightdm lightdm-gtk-greeter); DISPLAY_MANAGER="lightdm" ;;
+  i3) DESKTOP_PKGS=(i3-wm i3status dmenu xorg xorg-server lightdm lightdm-gtk-greeter); DISPLAY_MANAGER="lightdm" ;;
+  Sway) DESKTOP_PKGS=(sway wlroots wayland xorg-xwayland waybar mako swaybg lightdm lightdm-gtk-greeter); DISPLAY_MANAGER="lightdm" ;;
+  Hyprland) DESKTOP_PKGS=(hyprland wayland xorg-xwayland waybar swaybg mako lightdm lightdm-gtk-greeter); DISPLAY_MANAGER="lightdm" ;;
+  *) DESKTOP_PKGS=(xfce4 xfce4-goodies lightdm lightdm-gtk-greeter); DISPLAY_MANAGER="lightdm" ;;
 esac
 
 if ask "Install PipeWire audio?"; then
-  AUDIO_PKGS=(pipewire pipewire-alsa pipewire-pulse wireplumber)
+  AUDIO_PKGS=(pipewire pipewire-alsa pipewire-pulse wireplumber)
 else
-  AUDIO_PKGS=()
+  AUDIO_PKGS=()
 fi
 
 # Optional packages (checklist)
@@ -189,7 +212,7 @@ fi
 NVIDIA_PRESENT=$(lspci -nn | grep -i -E 'nvidia|geforce' || true)
 INSTALL_NVIDIA="no"
 if [[ -n "$NVIDIA_PRESENT" ]]; then
-  if ask "NVIDIA GPU detected. Install proprietary drivers?"; then INSTALL_NVIDIA="yes"; fi
+  if ask "NVIDIA GPU detected. Install proprietary drivers?"; then INSTALL_NVIDIA="yes"; fi
 fi
 
 HOSTNAME=$(input "Enter hostname (e.g. arch-vm):") || die "Cancelled"
@@ -197,6 +220,7 @@ USERNAME=$(input "Enter username:") || die "Cancelled"
 ROOT_PASS=$(password_input "Enter root password (hidden):") || die "Cancelled"
 USER_PASS=$(password_input "Enter password for $USERNAME (hidden):") || die "Cancelled"
 TIMEZONE=$(input "Enter timezone (e.g. UTC or Europe/Berlin):") || die "Cancelled"
+
 LOCALE=$(input "Enter locale (e.g. en_US.UTF-8):") || die "Cancelled"
 
 REVIEW="Disk: $DISK
@@ -220,35 +244,41 @@ Locale: $LOCALE"
 ask "$REVIEW\n\nClick YES to Install Now (this will make changes to the selected disk/partition)" || die "Installation cancelled"
 
 # ----------------------
-# Auto partition if requested
+# Auto partition if requested (FIX: Added robust device waiting)
 # ----------------------
 if [[ "$AUTO_PART" == "yes" ]]; then
-  msg "Auto-creating partitions on $DISK..."
-  if [[ "$USE_EFI" == "yes" ]]; then
-    parted -s "$DISK" mklabel gpt || die "Failed to create GPT label"
-    # FIX: Ensure kernel re-reads partition table and device node exists
+  msg "Auto-creating partitions on $DISK..."
+  if [[ "$USE_EFI" == "yes" ]]; then
+    parted -s "$DISK" mklabel gpt || die "Failed to create GPT label"
     partprobe "$DISK" || true 
-    sleep 2
+    sleep 1
     
-    parted -s "$DISK" mkpart primary fat32 1MiB 551MiB || die "Failed to create EFI partition"
-    parted -s "$DISK" set 1 esp on || true
-    parted -s "$DISK" mkpart primary ext4 551MiB 100% || die "Failed to create root partition"
-    if [[ "$DISK" =~ nvme ]]; then
-      EFI_PART="${DISK}p1"; ROOT_PART="${DISK}p2"
-    else
-      EFI_PART="${DISK}1"; ROOT_PART="${DISK}2"
-    fi
-  else
-    parted -s "$DISK" mklabel msdos || die "Failed to create msdos label"
-    # FIX: Ensure kernel re-reads partition table and device node exists
+    parted -s "$DISK" mkpart primary fat32 1MiB 551MiB || die "Failed to create EFI partition"
+    parted -s "$DISK" set 1 esp on || true
+    parted -s "$DISK" mkpart primary ext4 551MiB 100% || die "Failed to create root partition"
+    
+    if [[ "$DISK" =~ nvme ]]; then
+      EFI_PART="${DISK}p1"; ROOT_PART="${DISK}p2"
+    else
+      EFI_PART="${DISK}1"; ROOT_PART="${DISK}2"
+    fi
+    
+    wait_for_device "$EFI_PART"
+    wait_for_device "$ROOT_PART"
+
+  else # BIOS/Legacy mode
+    parted -s "$DISK" mklabel msdos || die "Failed to create msdos label"
     partprobe "$DISK" || true 
-    sleep 2
+    sleep 1
     
-    parted -s "$DISK" mkpart primary ext4 1MiB 100% || die "Failed to create root partition"
-    if [[ "$DISK" =~ nvme ]]; then ROOT_PART="${DISK}p1"; else ROOT_PART="${DISK}1"; fi
-    EFI_PART=""
-  fi
-  success "Created partitions: root=${ROOT_PART} efi=${EFI_PART:-<none>}"
+    parted -s "$DISK" mkpart primary ext4 1MiB 100% || die "Failed to create root partition"
+    
+    if [[ "$DISK" =~ nvme ]]; then ROOT_PART="${DISK}p1"; else ROOT_PART="${DISK}1"; fi
+    EFI_PART=""
+    
+    wait_for_device "$ROOT_PART"
+  fi
+  success "Created partitions: root=${ROOT_PART} efi=${EFI_PART:-<none>}"
 fi
 
 # sanity
@@ -256,20 +286,20 @@ if [[ -z "${ROOT_PART:-}" ]]; then die "No root partition selected or created.";
 
 # final format confirmation
 if [[ "$DO_FORMAT" == "yes" ]]; then
-  if ! ask "About to format $ROOT_PART ${EFI_PART:+and $EFI_PART}. This will erase data. Are you 100% sure?"; then die "User aborted before formatting."; fi
+  if ! ask "About to format $ROOT_PART ${EFI_PART:+and $EFI_PART}. This will erase data. Are you 100% sure?"; then die "User aborted before formatting."; fi
 fi
 
 # format partitions
 if [[ "$DO_FORMAT" == "yes" ]]; then
-  gauge_step "Formatting" "Formatting partitions..." 3
-  case "$FS_ROOT" in
-    ext4) mkfs.ext4 -F "$ROOT_PART" ;;
-    btrfs) mkfs.btrfs -f "$ROOT_PART" ;;
-    xfs) mkfs.xfs -f "$ROOT_PART" ;;
-    *) die "Unsupported filesystem: $FS_ROOT" ;;
-  esac
-  if [[ -n "${EFI_PART:-}" ]]; then mkfs.fat -F32 "$EFI_PART"; fi
-  success "Formatting complete"
+  gauge_step "Formatting" "Formatting partitions..." 3
+  case "$FS_ROOT" in
+    ext4) mkfs.ext4 -F "$ROOT_PART" ;;
+    btrfs) mkfs.btrfs -f "$ROOT_PART" ;;
+    xfs) mkfs.xfs -f "$ROOT_PART" ;;
+    *) die "Unsupported filesystem: $FS_ROOT" ;;
+  esac
+  if [[ -n "${EFI_PART:-}" ]]; then mkfs.fat -F32 "$EFI_PART"; fi
+  success "Formatting complete"
 fi
 
 # mount
@@ -284,10 +314,10 @@ gauge_step "Base install" "Installing base system (pacstrap)..." 10
 
 # FIX: Dynamically determine and install kernel headers for DKMS/VM tools 
 case "$KERNEL" in
-  linux) HDR_PKG="linux-headers" ;;
-  linux-lts) HDR_PKG="linux-lts-headers" ;;
-  linux-zen) HDR_PKG="linux-zen-headers" ;;
-  *) HDR_PKG="${KERNEL}-headers" ;;
+  linux) HDR_PKG="linux-headers" ;;
+  linux-lts) HDR_PKG="linux-lts-headers" ;;
+  linux-zen) HDR_PKG="linux-zen-headers" ;;
+  *) HDR_PKG="${KERNEL}-headers" ;;
 esac
 
 # Add kernel headers to ensure DKMS (NVIDIA, VBox) works
@@ -300,15 +330,16 @@ success "Base and fstab created"
 # install desktop, audio, optional packages
 gauge_step "Packages" "Installing desktop & selected packages..." 10
 if [ ${#DESKTOP_PKGS[@]} -ne 0 ] || [ ${#AUDIO_PKGS[@]} -ne 0 ]; then
-  arch_chroot "pacman -Syu --noconfirm ${DESKTOP_PKGS[*]} ${AUDIO_PKGS[*]}"
+  arch_chroot "pacman -Syu --noconfirm ${DESKTOP_PKGS[*]} ${AUDIO_PKGS[*]}"
 fi
 if [ ${#OPTIONAL_PKGS[@]} -ne 0 ]; then
-  arch_chroot "pacman -S --noconfirm ${OPTIONAL_PKGS[*]}" || msg "Some optional packages failed"
+  arch_chroot "pacman -S --noconfirm ${OPTIONAL_PKGS[*]}" || msg "Some optional packages failed"
 fi
 success "Packages installed"
 
 # configure system
 gauge_step "Configure" "Applying system configuration..." 5
+
 arch_chroot "echo $HOSTNAME > /etc/hostname"
 arch_chroot "ln -sf /usr/share/zoneinfo/$TIMEZONE /etc/localtime && hwclock --systohc"
 arch_chroot "echo '$LOCALE UTF-8' > /etc/locale.gen && locale-gen && echo LANG=$LOCALE > /etc/locale.conf"
@@ -321,10 +352,10 @@ success "System configured"
 
 # NVIDIA drivers if desired
 if [[ "$INSTALL_NVIDIA" == "yes" ]]; then
-  gauge_step "NVIDIA" "Installing NVIDIA drivers..." 5
-  # Use nvidia-dkms since kernel headers are now guaranteed to be installed
-  arch_chroot "pacman -S --noconfirm nvidia-dkms nvidia-utils nvidia-settings" || msg "NVIDIA install had issues"
-  success "NVIDIA handled"
+  gauge_step "NVIDIA" "Installing NVIDIA drivers..." 5
+  # Use nvidia-dkms since kernel headers are now guaranteed to be installed
+  arch_chroot "pacman -S --noconfirm nvidia-dkms nvidia-utils nvidia-settings" || msg "NVIDIA install had issues"
+  success "NVIDIA handled"
 fi
 
 # VM guest tools (based on systemd-detect-virt)
@@ -333,32 +364,32 @@ VIRT_LOWER=$(echo "$VIRT" | tr '[:upper:]' '[:lower:]')
 VM_PKGS=()
 VM_ENABLE_CMDS=()
 if [[ "$VIRT_LOWER" == "oracle" || "$VIRT_LOWER" == "virtualbox" ]]; then
-  VM_PKGS+=(virtualbox-guest-dkms dkms virtualbox-guest-utils)
-  VM_ENABLE_CMDS+=( "systemctl enable vboxservice" )
+  VM_PKGS+=(virtualbox-guest-dkms dkms virtualbox-guest-utils)
+  VM_ENABLE_CMDS+=( "systemctl enable vboxservice" )
 elif [[ "$VIRT_LOWER" == "vmware" ]]; then
-  VM_PKGS+=(open-vm-tools)
-  VM_ENABLE_CMDS+=( "systemctl enable --now vmtoolsd" )
-elif [[ "$VIRT_LOWER" == "kvm" || "$VIRT_LOWER" == "kvmqemu" || "$VIRT_LOWER" == "qemu" ]]; then
-  VM_PKGS+=(qemu-guest-agent)
-  VM_ENABLE_CMDS+=( "systemctl enable --now qemu-guest-agent" )
+  VM_PKGS+=(open-vm-tools)
+  VM_ENABLE_CMDS+=( "systemctl enable --now vmtoolsd" )
+elif [[ "$VIRT_LOWER" == "kvm"  "$VIRT_LOWER" == "kvmqemu"  "$VIRT_LOWER" == "qemu" ]]; then
+  VM_PKGS+=(qemu-guest-agent)
+  VM_ENABLE_CMDS+=( "systemctl enable --now qemu-guest-agent" )
 elif [[ "$VIRT_LOWER" == "microsoft" || "$VIRT_LOWER" == "hyperv" ]]; then
-  VM_PKGS+=(hyperv-daemons)
-  VM_ENABLE_CMDS+=( "systemctl enable --now hv-fcopy-daemon || true" )
+  VM_PKGS+=(hyperv-daemons)
+  VM_ENABLE_CMDS+=( "systemctl enable --now hv-fcopy-daemon || true" )
 fi
 
 # install VM pkgs if any (clean empty tokens)
 if [ ${#VM_PKGS[@]} -ne 0 ]; then
-  CLEAN_VM_PKGS=()
-  for p in "${VM_PKGS[@]}"; do
-    [[ -n "$p" ]] && CLEAN_VM_PKGS+=("$p")
-  done
-  if [ ${#CLEAN_VM_PKGS[@]} -ne 0 ]; then
-    arch_chroot "pacman -S --noconfirm ${CLEAN_VM_PKGS[*]}" || msg "VM guest tools install had issues"
-    for cmd in "${VM_ENABLE_CMDS[@]}"; do arch_chroot "$cmd" || true; done
-    success "VM guest tools installed (if available in repos)"
-  fi
+  CLEAN_VM_PKGS=()
+  for p in "${VM_PKGS[@]}"; do
+    [[ -n "$p" ]] && CLEAN_VM_PKGS+=("$p")
+  done
+  if [ ${#CLEAN_VM_PKGS[@]} -ne 0 ]; then
+    arch_chroot "pacman -S --noconfirm ${CLEAN_VM_PKGS[*]}" || msg "VM guest tools install had issues"
+    for cmd in "${VM_ENABLE_CMDS[@]}"; do arch_chroot "$cmd" || true; done
+    success "VM guest tools installed (if available in repos)"
+  fi
 else
-  msg "No VM guest tools required for $VIRT"
+  msg "No VM guest tools required for $VIRT"
 fi
 
 # bootloader installation
@@ -366,32 +397,32 @@ gauge_step "Bootloader" "Installing bootloader..." 6
 case "$KERNEL" in linux) KVER="linux" ;; linux-lts) KVER="linux-lts" ;; linux-zen) KVER="linux-zen" ;; *) KVER="$KERNEL" ;; esac
 
 if [[ "$BOOTLOADER" == "systemd-boot" ]]; then
-  arch_chroot "bootctl --path=/boot/efi install || true"
-  ROOT_UUID=$(blkid -s UUID -o value "$ROOT_PART")
-  arch_chroot "mkdir -p /boot/efi/loader/entries"
-  arch_chroot "cat >/boot/efi/loader/entries/arch.conf <<'EOF'
-title   Arch Linux
-linux   /vmlinuz-${KVER}
-initrd  /initramfs-${KVER}.img
+  arch_chroot "bootctl --path=/boot/efi install || true"
+  ROOT_UUID=$(blkid -s UUID -o value "$ROOT_PART")
+  arch_chroot "mkdir -p /boot/efi/loader/entries"
+  arch_chroot "cat >/boot/efi/loader/entries/arch.conf <<'EOF'
+title   Arch Linux
+linux   /vmlinuz-${KVER}
+initrd  /initramfs-${KVER}.img
 options root=UUID=${ROOT_UUID} rw
 EOF"
-  arch_chroot "echo 'default arch' > /boot/efi/loader/loader.conf"
-  success "systemd-boot installed"
+  arch_chroot "echo 'default arch' > /boot/efi/loader/loader.conf"
+  success "systemd-boot installed"
 else
-  arch_chroot "pacman -S --noconfirm grub" # os-prober is already in base
-  if [[ "$USE_EFI" == "yes" ]]; then
-    arch_chroot "grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB --recheck || true"
-  else
-    DISK_FOR_GRUB=$(echo "$ROOT_PART" | sed -E 's/p?[0-9]+$//')
-    arch_chroot "grub-install --target=i386-pc --recheck $DISK_FOR_GRUB || true"
-  fi
-  arch_chroot "grub-mkconfig -o /boot/grub/grub.cfg || true"
-  success "GRUB installed"
+  arch_chroot "pacman -S --noconfirm grub" # os-prober is already in base
+  if [[ "$USE_EFI" == "yes" ]]; then
+    arch_chroot "grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB --recheck || true"
+  else
+    DISK_FOR_GRUB=$(echo "$ROOT_PART" | sed -E 's/p?[0-9]+$//')
+    arch_chroot "grub-install --target=i386-pc --recheck $DISK_FOR_GRUB || true"
+  fi
+  arch_chroot "grub-mkconfig -o /boot/grub/grub.cfg || true"
+  success "GRUB installed"
 fi
 
 # Enable display manager
 if [[ -n "$DISPLAY_MANAGER" ]]; then
-  arch_chroot "systemctl enable $DISPLAY_MANAGER" || msg "Failed to enable display manager $DISPLAY_MANAGER"
+  arch_chroot "systemctl enable $DISPLAY_MANAGER" || msg "Failed to enable display manager $DISPLAY_MANAGER"
 fi
 
 whiptail --title "Done" --msgbox "Installation finished!\n\nNext steps (in live environment):\n1) umount -R $MNT\n2) reboot\n\nLogin as root or $USERNAME after reboot." 15 70
