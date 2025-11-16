@@ -11,7 +11,7 @@ exec &> >(tee -a "$LOG")
 
 MNT="/mnt"
 
-whiptail --title "Arch TUI Installer (Final Stable)" --msgbox "Welcome. This version uses text input for partition paths to ensure stability in your VM." 12 70
+whiptail --title "AME Installer (v1 Stable)" --msgbox "Welcome! This is a beta stable version of ArchMadeEasy, which is designed to give you the best experience and safety." 12 70
 
 die(){ echo -e "${RED}ERROR:${RESET} $*" | tee -a "$LOG"; exit 1; }
 msg(){ echo -e "${YELLOW}$*${RESET}" | tee -a "$LOG"; }
